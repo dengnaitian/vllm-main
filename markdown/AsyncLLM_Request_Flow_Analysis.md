@@ -37,6 +37,90 @@ async def generate(
 
 这是生成任务的主要入口点，被 API 服务器调用。
 
+### 请求处理时序图
+
+下面是 AsyncLLM 处理一个完整请求的时序图，展示了各个组件之间的交互：
+
+```mermaid
+sequenceDiagram
+    participant API as API Server
+    participant AsyncLLM as AsyncLLM
+    participant IP as InputProcessor
+    participant OP as OutputProcessor
+    participant ECC as EngineCoreClient
+    participant EC as EngineCore
+    participant OH as OutputHandler
+    participant ROC as RequestOutputCollector
+
+    Note over API, EC: 请求初始化和预处理
+    API->>AsyncLLM: generate(prompt, params, request_id)
+    AsyncLLM->>AsyncLLM: _run_output_handler() [首次调用]
+    AsyncLLM->>AsyncLLM: 等待恢复（如果暂停）
+    AsyncLLM->>AsyncLLM: add_request()
+
+    Note over AsyncLLM, ROC: 创建输出收集器
+    AsyncLLM->>ROC: 创建 RequestOutputCollector
+
+    Note over AsyncLLM, IP: 输入处理
+    AsyncLLM->>IP: process_inputs()
+    IP->>IP: tokenization / 多模态处理
+    IP-->>AsyncLLM: 返回 EngineCoreRequest
+
+    Note over AsyncLLM, ROC: 处理并行采样（n>1）
+    alt params.n > 1
+        loop n 次
+            AsyncLLM->>OP: add_request()
+            AsyncLLM->>ECC: add_request_async()
+            ECC-->>AsyncLLM: 确认添加
+        end
+    else
+        AsyncLLM->>OP: add_request()
+        AsyncLLM->>ECC: add_request_async()
+        ECC-->>AsyncLLM: 确认添加
+    end
+
+    Note over ECC, EC: 请求发送到核心引擎
+    ECC->>EC: 通过 ZMQ 发送请求
+    EC->>EC: preprocess_add_request()
+    EC->>EC: 加入调度队列
+
+    Note over API, ROC: 主线程等待输出
+    AsyncLLM->>API: 返回 AsyncGenerator
+    API->>ROC: get_nowait() / await get()
+
+    Note over OH, EC: OutputHandler 后台处理循环
+    loop 持续运行
+        OH->>EC: get_output_async()
+        EC->>EC: 执行推理
+        EC-->>OH: EngineCoreOutputs
+
+        Note over OH, ROC: 输出处理
+        OH->>OP: process_outputs()
+        OP->>OP: 处理每个请求的输出
+        OP->>ROC: put(RequestOutput)
+
+        Note over OH, EC: 处理完成请求
+        OH->>EC: abort_requests_async() [如果需要]
+    end
+
+    Note over API, ROC: 流式返回结果
+    loop 直到完成
+        ROC-->>API: RequestOutput
+        API-->>Client: 流式响应
+    end
+
+    Note over AsyncLLM, EC: 错误处理
+    alt 请求被取消
+        API->>AsyncLLM: CancelledError
+        AsyncLLM->>ECC: abort_requests_async()
+        ECC->>EC: 中止请求
+    else 引擎错误
+        EC->>ECC: EngineDeadError
+        ECC->>AsyncLLM: 传播错误
+        AsyncLLM->>API: EngineDeadError
+    end
+```
+
 ### 2. 请求处理流程
 
 #### 步骤 1: 请求预处理 ([`async_llm.py:401-429`](vllm/v1/engine/async_llm.py#L401-L429))
