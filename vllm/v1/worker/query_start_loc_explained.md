@@ -160,6 +160,76 @@ def build_attn_metadata(
 
 ---
 
+### 2.5. **在 FlashAttention 内核中的使用（核心推理路径）**
+
+**文件**: `vllm/v1/attention/backends/flash_attn.py:331-489`
+
+```python
+def forward(self, ...):
+    # 从注意力元数据中提取 query_start_loc
+    query_start_loc = common_attn_metadata.query_start_loc  # ← 提取
+    seq_lens = common_attn_metadata.seq_lens
+    block_table_tensor = common_attn_metadata.block_table_tensor
+    slot_mapping = common_attn_metadata.slot_mapping
+
+    # 使用 query_start_loc 调度 FlashAttention
+    scheduler_metadata = schedule(
+        batch_size=num_reqs,
+        cu_query_lens=query_start_loc,  # ← 传递给 FlashAttention 调度器
+        max_query_len=max_query_len,
+        seqlens=seq_lens,
+        max_seq_len=max_seq_len,
+        causal=causal,
+    )
+
+    # 调用 FlashAttention 内核
+    flash_attn_varlen_func(
+        q=query,
+        k=key_cache,
+        v=value_cache,
+        cu_seqlens_q=query_start_loc,  # ← FlashAttention 需要的参数
+        cu_seqlens_k=...,
+        max_seqlen_q=max_query_len,
+        block_table=block_table_tensor,
+        # ... 其他参数
+    )
+```
+
+**这是 `query_start_loc` 最关键的使用场景！**
+
+**解释**：
+- FlashAttention 是一个高效的注意力计算内核
+- `cu_seqlens_q`（即 `query_start_loc`）是 FlashAttention 的**必需参数**
+- FlashAttention 使用 `query_start_loc` 来：
+  1. 确定每个请求的 query 在扁平化 Q 张量中的起始和结束位置
+  2. 优化内存访问模式，提高缓存命中率
+  3. 并行化计算多个请求的注意力
+
+**为什么 FlashAttention 需要 query_start_loc？**
+
+FlashAttention 接收**扁平化**的 Q、K、V 张量，而不是分批次的三维张量。例如：
+
+```python
+# 传统注意力（分批次）
+q.shape = [batch_size, seq_len, head_dim]
+
+# FlashAttention（扁平化）
+q.shape = [total_tokens, head_dim]  # 所有请求的 tokens 拼在一起
+# 需要 query_start_loc 来知道每个请求的 token 在哪里
+```
+
+**实际代码位置**：
+- `flash_attn.py:405` - 计算查询长度：`query_kv_lens = query_start_loc[1:] - query_start_loc[:-1]`
+- `flash_attn.py:425` - 传递给级联注意力：`cu_query_lens=query_start_loc`
+- `flash_attn.py:459` - 传递给调度器：`cu_query_lens=query_start_loc`
+- `flash_attn.py:479` - 传递给 FlashAttention 内核：`cu_seqlens_q=query_start_loc`
+- `flash_attn.py:676` - FlashAttention V2 内核：`cu_seqlens_q = attn_metadata.query_start_loc`
+- `flash_attn.py:731` - 带解码上下文并行：`cu_query_lens=attn_metadata.query_start_loc`
+- `flash_attn.py:767` - 上下文注意力：`cu_seqlens_q = attn_metadata.query_start_loc`
+- `flash_attn.py:860` - 仅前缀缓存：`cu_seqlens_q = attn_metadata.query_start_loc`
+
+---
+
 ### 3. **计算 Slot Mapping（KV 缓存映射）**
 
 **文件**: `vllm/v1/worker/gpu/block_table.py:161-183`
@@ -365,6 +435,7 @@ class EAGLE:
 |---------|---------|------|
 | **采样索引计算** | `gpu_model_runner.py:1466` | 提取每个请求的最后一个 token 索引 |
 | **注意力元数据构建** | `gpu_model_runner.py:1591`<br>`attn_utils.py:168` | 传递给注意力内核 |
+| **⭐ FlashAttention 内核** | `flash_attn.py:331`<br>`flash_attn.py:405`<br>`flash_attn.py:676`<br>`flash_attn.py:731` | **核心推理路径：传递给 FlashAttention 作为 cu_seqlens_q 参数** |
 | **KV 缓存映射** | `block_table.py:166` | 计算 slot mapping |
 | **Prefill Token 复制** | `input_batch.py:165-166` | Triton 内核中确定写入位置 |
 | **位置计算** | `input_batch.py:228-229` | 计算序列长度和位置 |
